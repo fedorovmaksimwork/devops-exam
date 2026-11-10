@@ -1,0 +1,258 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: app1-python } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install ruff==0.9.6
+      - run: ruff check .
+      - run: ruff format --check .
+
+  lint-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23", cache: false }
+      - name: go mod tidy
+        working-directory: app2-go
+        run: go mod tidy
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.63.4
+          working-directory: app2-go
+
+  lint-docker:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { dockerfile: [app1-python/Dockerfile, app2-go/Dockerfile] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          failure-threshold: error
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.23.3 \
+            detect --source /repo --no-banner --redact
+
+  test-python:
+    needs: lint-python
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: app1-python } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  test-go:
+    needs: lint-go
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: app2-go } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23", cache: false }
+      - run: go mod tidy
+      - run: go vet ./...
+      - run: go test -v -race ./...
+
+  build:
+    needs: [test-python, test-go, lint-docker, secrets-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        app: [app1-python, app2-go]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: meta
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=${REGISTRY}/${owner}/${{ matrix.app }}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.app }}
+          load: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          build-args: APP_VERSION=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Smoke test
+        run: |
+          port=$([ "${{ matrix.app }}" = "app1-python" ] && echo 8000 || echo 8080)
+          expected=$([ "${{ matrix.app }}" = "app1-python" ] && echo "Hello World 1" || echo "Hello World 2")
+          docker run -d --name smoke -p 9999:$port ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          for i in $(seq 1 20); do curl -fs localhost:9999/ && break; sleep 1; done
+          body=$(curl -fs localhost:9999/)
+          docker logs smoke
+          test "$body" = "$expected"
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.app }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          build-args: APP_VERSION=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    needs: build
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      vars.DEPLOY_ENABLED == 'true'
+    runs-on: [self-hosted, linux, wsl]
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      HTTP_PORT: ${{ vars.HTTP_PORT || '80' }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          if [ -z "$GRAFANA_ADMIN_PASSWORD" ]; then
+            echo "::error::GRAFANA_ADMIN_PASSWORD is not set"; exit 1
+          fi
+          echo "DEPLOY_DIR=${DEPLOY_DIR:-$HOME/devops-exam}" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy stack
+        run: |
+          mkdir -p "$DEPLOY_DIR"
+          cp -r deploy/. "$DEPLOY_DIR/"
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          umask 077
+          cat > "$DEPLOY_DIR/.env" <<EOF
+          REGISTRY=${REGISTRY}
+          IMAGE_OWNER=${owner}
+          IMAGE_TAG=sha-${GITHUB_SHA::7}
+          HTTP_PORT=${HTTP_PORT}
+          GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+          EOF
+
+      - name: Deploy
+        run: |
+          cd "$DEPLOY_DIR"
+          docker compose pull
+          docker compose up -d --remove-orphans
+          docker compose exec -T nginx nginx -s reload
+          docker image prune -f
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            curl -fs "http://localhost:${HTTP_PORT}/app1/" | grep -q "Hello World 1" &&
+            curl -fs "http://localhost:${HTTP_PORT}/app2/" | grep -q "Hello World 2" && exit 0
+            sleep 2
+          done
+          echo "Smoke test failed"; exit 1
+
+      - name: Logout
+        if: always()
+        run: docker logout ${{ env.REGISTRY }}
+
+  notify:
+    needs: [lint-python, lint-go, lint-docker, secrets-scan, test-python, test-go, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Telegram
+        if: env.TG_TOKEN != ''
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            status="FAILED"
+          else
+            status="SUCCESS"
+          fi
+          text="${status} — ${{ github.repository }}
+          Workflow: ${{ github.workflow }} (#${{ github.run_number }})
+          Branch: ${{ github.ref_name }}
+          Commit: ${GITHUB_SHA::7} by ${{ github.actor }}
+          Build: ${{ needs.build.result }} | Deploy: ${{ needs.deploy.result }}
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -fsS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=${text}" > /dev/null
+      - name: Telegram skipped
+        if: env.TG_TOKEN == ''
+        run: echo "::notice::Telegram is not configured"
